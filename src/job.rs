@@ -138,7 +138,7 @@ impl<F> JobStack<F> {
 }
 
 pub trait ExecuteJob<'s>: Send + Sync {
-    unsafe fn execute(&self, scope: &mut Scope<'s>);
+    unsafe fn execute(self: Box<Self>, scope: &mut Scope<'s>);
 
     fn id(&self) -> usize;
 }
@@ -179,7 +179,7 @@ impl<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> ExecuteJob<'s> for Job<
     /// SAFETY:
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
-    unsafe fn execute(&self, scope: &mut Scope<'s>) {
+    unsafe fn execute(self: Box<Self>, scope: &mut Scope<'s>) {
         // SAFETY:
         // The `stack` is still alive.
         let stack: &JobStack<F> = unsafe { self.stack.cast().as_ref() };

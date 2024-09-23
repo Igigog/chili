@@ -17,7 +17,7 @@ enum Poll {
 }
 
 #[derive(Debug, Default)]
-pub struct Future<T = ()> {
+pub struct Future<T> {
     state: AtomicU8,
     /// Can only be accessed if `state` is `Poll::Locked`.
     waiting_thread: UnsafeCell<Option<Thread>>,
@@ -132,7 +132,7 @@ impl<F> JobStack<F> {
 #[derive(Clone, Debug)]
 pub struct Job<T = ()> {
     stack: NonNull<JobStack>,
-    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future>),
+    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future<T>>),
     fut: Cell<Option<NonNull<Future<T>>>>,
 }
 
@@ -147,7 +147,7 @@ impl<T> Job<T> {
         unsafe fn harness<F, T>(
             scope: &mut Scope<'_>,
             stack: NonNull<JobStack>,
-            fut: NonNull<Future>,
+            fut: NonNull<Future<T>>,
         ) where
             F: FnOnce(&mut Scope<'_>) -> T + Send,
             T: Send,

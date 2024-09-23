@@ -130,7 +130,7 @@ impl<F> JobStack<F> {
 /// When popped from the `JobQueue`, it gets copied before sending across
 /// thread boundaries.
 #[derive(Clone, Debug)]
-pub struct Job<T = ()> {
+pub struct Job<T> {
     stack: NonNull<JobStack>,
     harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future<T>>),
     fut: Cell<Option<NonNull<Future<T>>>>,
@@ -179,7 +179,7 @@ impl<T> Job<T> {
         self.fut.get().is_none()
     }
 
-    pub fn eq(&self, other: &Job) -> bool {
+    pub fn eq<T2>(&self, other: &Job<T2>) -> bool {
         self.stack == other.stack
     }
 
@@ -232,7 +232,7 @@ impl<T> Job<T> {
     }
 }
 
-impl Job {
+impl<T> Job<T> {
     /// SAFETY:
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
@@ -250,10 +250,10 @@ impl Job {
 // The job's `stack` will only be accessed after acquiring a lock (in
 // `Future`), while `prev` and `fut_or_next` are never accessed after being
 // sent across threads.
-unsafe impl Send for Job {}
+unsafe impl<T> Send for Job<T> {}
 
 #[derive(Debug, Default)]
-pub struct JobQueue(VecDeque<NonNull<Job>>);
+pub struct JobQueue(VecDeque<NonNull<Job<()>>>);
 
 impl JobQueue {
     pub fn len(&self) -> usize {
@@ -271,7 +271,7 @@ impl JobQueue {
         self.0.pop_back();
     }
 
-    pub fn pop_front(&mut self) -> Option<Job> {
+    pub fn pop_front(&mut self) -> Option<Job<()>> {
         // SAFETY:
         // `Job` is still alive as per contract in `push_back`.
         let job = unsafe { self.0.pop_front()?.as_ref() };

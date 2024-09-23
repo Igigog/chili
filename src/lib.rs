@@ -75,7 +75,7 @@ struct Heartbeat {
 struct LockContext {
     time: u64,
     is_stopping: bool,
-    shared_jobs: BTreeMap<usize, (u64, Job)>,
+    shared_jobs: BTreeMap<usize, (u64, Job<()>)>,
     heartbeats: HashMap<u64, Heartbeat>,
     heartbeat_index: u64,
 }
@@ -96,7 +96,7 @@ impl LockContext {
         is_set
     }
 
-    pub fn pop_earliest_shared_job(&mut self) -> Option<Job> {
+    pub fn pop_earliest_shared_job(&mut self) -> Option<Job<()>> {
         self.shared_jobs
             .pop_first()
             .map(|(_, (_, shared_job))| shared_job)

@@ -1,10 +1,14 @@
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{RefCell, UnsafeCell},
     collections::VecDeque,
+    marker::PhantomData,
     mem::ManuallyDrop,
     panic::{self, AssertUnwindSafe},
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     thread::{self, Thread},
 };
 
@@ -27,11 +31,19 @@ pub struct Future<T> {
 }
 
 impl<T> Future<T> {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::default(),
+            waiting_thread: UnsafeCell::new(None),
+            val: UnsafeCell::new(None),
+        }
+    }
+
     pub fn poll(&self) -> bool {
         self.state.load(Ordering::Acquire) == Poll::Ready as u8
     }
 
-    pub fn wait(&self) -> Option<thread::Result<T>> {
+    pub fn wait(&self) -> thread::Result<T> {
         loop {
             let result = self.state.compare_exchange(
                 Poll::Pending as u8,
@@ -60,7 +72,7 @@ impl<T> Future<T> {
                     //
                     // Calling `Self::complete` when `state` is `Poll::Ready`
                     // cannot mutate `self.val`.
-                    break unsafe { (*self.val.get()).take().map(|b| *b) };
+                    break unsafe { *self.val.get().as_mut().unwrap().take().unwrap() };
                 }
                 _ => (),
             }
@@ -102,7 +114,7 @@ impl<T> Future<T> {
     }
 }
 
-pub struct JobStack<F = ()> {
+pub struct JobStack<F> {
     /// All code paths should call either `Job::execute` or `Self::unwrap` to
     /// avoid a potential memory leak.
     f: UnsafeCell<ManuallyDrop<F>>,
@@ -125,124 +137,67 @@ impl<F> JobStack<F> {
     }
 }
 
+pub trait ExecuteJob<'s>: Send + Sync {
+    unsafe fn execute(&self, scope: &mut Scope<'s>);
+
+    fn id(&self) -> usize;
+}
+
 /// `Job` is only sent, not shared between threads.
 ///
 /// When popped from the `JobQueue`, it gets copied before sending across
 /// thread boundaries.
-#[derive(Clone, Debug)]
-pub struct Job<T> {
-    stack: NonNull<JobStack>,
-    harness: unsafe fn(&mut Scope<'_>, NonNull<JobStack>, NonNull<Future<T>>),
-    fut: Cell<Option<NonNull<Future<T>>>>,
+#[derive(Debug)]
+pub struct Job<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> {
+    stack: NonNull<JobStack<F>>,
+    fut: RefCell<Option<Arc<Future<T>>>>,
+    _phantom: PhantomData<&'s ()>,
 }
 
-impl<T> Job<T> {
-    pub fn new<F>(stack: &JobStack<F>) -> Self
+impl<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> Job<'s, F, T> {
+    pub fn new(stack: &JobStack<F>) -> Self
     where
-        F: FnOnce(&mut Scope<'_>) -> T + Send,
+        F: FnOnce(&mut Scope<'s>) -> T + Send,
         T: Send,
     {
-        /// SAFETY:
-        /// It should only be called while the `stack` is still alive.
-        unsafe fn harness<F, T>(
-            scope: &mut Scope<'_>,
-            stack: NonNull<JobStack>,
-            fut: NonNull<Future<T>>,
-        ) where
-            F: FnOnce(&mut Scope<'_>) -> T + Send,
-            T: Send,
-        {
-            // SAFETY:
-            // The `stack` is still alive.
-            let stack: &JobStack<F> = unsafe { stack.cast().as_ref() };
-            // SAFETY:
-            // This is the first call to `take_once` since `Job::execute`
-            // (the only place where this harness is called) is called only
-            // after the job has been popped.
-            let f = unsafe { stack.take_once() };
-            // SAFETY:
-            // Before being popped, the `JobQueue` allocates and stores a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            let fut: &Future<T> = unsafe { fut.cast().as_ref() };
-
-            fut.complete(panic::catch_unwind(AssertUnwindSafe(|| f(scope))));
-        }
-
         Self {
             stack: NonNull::from(stack).cast(),
-            harness: harness::<F, T>,
-            fut: Cell::new(None),
+            fut: RefCell::new(None),
+            _phantom: PhantomData,
         }
     }
 
-    pub fn is_waiting(&self) -> bool {
-        self.fut.get().is_none()
-    }
+    pub fn prepare(&self) -> Arc<Future<T>> {
+        let f = Arc::new(Future::new());
+        self.fut.replace(Some(f.clone()));
 
-    pub fn eq<T2>(&self, other: &Job<T2>) -> bool {
-        self.stack == other.stack
-    }
-
-    /// SAFETY:
-    /// It should only be called after being popped from a `JobQueue`.
-    pub unsafe fn poll(&self) -> bool {
-        self.fut
-            .get()
-            .map(|fut| {
-                // SAFETY:
-                // Before being popped, the `JobQueue` allocates and stores a
-                // `Future` in `self.fur_or_next` that should get passed here.
-                let fut = unsafe { fut.as_ref() };
-                fut.poll()
-            })
-            .unwrap_or_default()
-    }
-
-    /// SAFETY:
-    /// It should only be called after being popped from a `JobQueue`.
-    pub unsafe fn wait(&self) -> Option<thread::Result<T>> {
-        self.fut.get().and_then(|fut| {
-            // SAFETY:
-            // Before being popped, the `JobQueue` allocates and stores a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            let result = unsafe { fut.as_ref().wait() };
-            // SAFETY:
-            // We only can drop the `Box` *after* waiting on the `Future`
-            // in order to ensure unique access.
-            unsafe {
-                drop(Box::from_raw(fut.as_ptr()));
-            }
-
-            result
-        })
-    }
-
-    /// SAFETY:
-    /// It should only be called in the case where the job has been popped
-    /// from the front and will not be `Job::Wait`ed.
-    pub unsafe fn drop(&self) {
-        if let Some(fut) = self.fut.get() {
-            // SAFETY:
-            // Before being popped, the `JobQueue` allocates and store a
-            // `Future` in `self.fur_or_next` that should get passed here.
-            unsafe {
-                drop(Box::from_raw(fut.as_ptr()));
-            }
-        }
+        f
     }
 }
 
-impl<T> Job<T> {
+impl<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> ExecuteJob<'s> for Job<'s, F, T> {
     /// SAFETY:
     /// It should only be called while the `JobStack` it was created with is
     /// still alive and after being popped from a `JobQueue`.
-    pub unsafe fn execute(&self, scope: &mut Scope<'_>) {
+    unsafe fn execute(&self, scope: &mut Scope<'s>) {
         // SAFETY:
-        // Before being popped, the `JobQueue` allocates and store a
-        // `Future` in `self.fur_or_next` that should get passed here.
-        unsafe {
-            (self.harness)(scope, self.stack, self.fut.get().unwrap());
-        }
+        // The `stack` is still alive.
+        let stack: &JobStack<F> = unsafe { self.stack.cast().as_ref() };
+        // SAFETY:
+        // This is the first call to `take_once` since `Job::execute`
+        // (the only place where this harness is called) is called only
+        // after the job has been popped.
+        let f = unsafe { stack.take_once() };
+
+        self.fut
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .complete(panic::catch_unwind(AssertUnwindSafe(|| f(scope))));
+    }
+
+    fn id(&self) -> usize {
+        self.stack.as_ptr() as usize
     }
 }
 
@@ -250,34 +205,29 @@ impl<T> Job<T> {
 // The job's `stack` will only be accessed after acquiring a lock (in
 // `Future`), while `prev` and `fut_or_next` are never accessed after being
 // sent across threads.
-unsafe impl<T> Send for Job<T> {}
+unsafe impl<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> Send for Job<'s, F, T> {}
 
-#[derive(Debug, Default)]
-pub struct JobQueue(VecDeque<NonNull<Job<()>>>);
+unsafe impl<'s, F: FnOnce(&mut Scope<'s>) -> T + Send, T: Send> Sync for Job<'s, F, T> {}
 
-impl JobQueue {
+#[derive(Default)]
+pub struct JobQueue<'s>(VecDeque<Box<dyn ExecuteJob<'s> + 's>>);
+
+impl<'s> JobQueue<'s> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// SAFETY:
-    /// Any `Job` pushed onto the queue should alive at least until it gets
-    /// popped.
-    pub unsafe fn push_back<T>(&mut self, job: &Job<T>) {
-        self.0.push_back(NonNull::from(job).cast());
+    pub fn push_back(&mut self, job: Box<dyn ExecuteJob<'s> + 's>) {
+        self.0.push_back(job);
     }
 
-    pub fn pop_back(&mut self) {
-        self.0.pop_back();
+    pub fn pop_back(&mut self) -> Option<Box<dyn ExecuteJob<'s> + 's>> {
+        self.0.pop_back()
     }
 
-    pub fn pop_front(&mut self) -> Option<Job<()>> {
-        // SAFETY:
-        // `Job` is still alive as per contract in `push_back`.
-        let job = unsafe { self.0.pop_front()?.as_ref() };
-        job.fut
-            .set(Some(Box::leak(Box::new(Future::default())).into()));
+    pub fn pop_front(&mut self) -> Option<Box<dyn ExecuteJob<'s> + 's>> {
+        let job = self.0.pop_front()?;
 
-        Some(job.clone())
+        Some(job)
     }
 }

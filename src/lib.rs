@@ -16,7 +16,7 @@
 //! # Examples
 //!
 //! ```
-//! # use chili::Scope;
+//! # use chili::{Scope, ThreadPool};
 //! struct Node {
 //!     val: u64,
 //!     left: Option<Box<Node>>,
@@ -33,7 +33,7 @@
 //!     }
 //! }
 //!
-//! fn sum(node: &Node, scope: &mut Scope<'_>) -> u64 {
+//! fn sum<'s, 'a: 's>(node: &'a Node, scope: &mut Scope<'s>) -> u64 {
 //!     let (left, right) = scope.join(
 //!         |s| node.left.as_deref().map(|n| sum(n, s)).unwrap_or_default(),
 //!         |s| node.right.as_deref().map(|n| sum(n, s)).unwrap_or_default(),
@@ -43,15 +43,20 @@
 //! }
 //!
 //! let tree = Node::tree(10);
+//! let result: u64;
+//!{
+//!    let thread_pool = ThreadPool::new();
+//!    let mut scope = thread_pool.scope();
+//! result = sum(&tree, &mut scope);
+//! }
 //!
-//! assert_eq!(sum(&tree, &mut Scope::global()), 1023);
+//! assert_eq!(result, 1023);
 //! ```
 
 use std::{
     cell::Cell,
     collections::{btree_map::Entry, BTreeMap, HashMap},
     num::NonZero,
-    ops::{Deref, DerefMut},
     panic,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -63,7 +68,7 @@ use std::{
 
 mod job;
 
-use job::{Job, JobQueue, JobStack};
+use job::{ExecuteJob, Future, Job, JobQueue, JobStack};
 
 #[derive(Debug)]
 struct Heartbeat {
@@ -75,7 +80,6 @@ struct Heartbeat {
 struct LockContext {
     time: u64,
     is_stopping: bool,
-    shared_jobs: BTreeMap<usize, (u64, Job<()>)>,
     heartbeats: HashMap<u64, Heartbeat>,
     heartbeat_index: u64,
 }
@@ -95,12 +99,6 @@ impl LockContext {
 
         is_set
     }
-
-    pub fn pop_earliest_shared_job(&mut self) -> Option<Job<()>> {
-        self.shared_jobs
-            .pop_first()
-            .map(|(_, (_, shared_job))| shared_job)
-    }
 }
 
 #[derive(Debug)]
@@ -113,16 +111,10 @@ struct Context {
 fn execute_worker(context: Arc<Context>, barrier: Arc<Barrier>) -> Option<()> {
     let mut first_run = true;
 
-    let mut job_queue = JobQueue::default();
-    let mut scope = Scope::new_from_worker(context.clone(), &mut job_queue);
+    let mut scope = Scope::new_from_worker(context.clone());
 
     loop {
-        let job = {
-            let mut lock = context.lock.lock().unwrap();
-            lock.pop_earliest_shared_job()
-        };
-
-        if let Some(job) = job {
+        if let Some(job) = scope.pop_earliest_shared_job() {
             // SAFETY:
             // Any `Job` that was shared between threads is waited upon before
             // the `JobStack` exits scope.
@@ -191,54 +183,29 @@ fn execute_heartbeat(
     Some(())
 }
 
-#[derive(Debug)]
-enum ThreadJobQueue<'s> {
-    Worker(&'s mut JobQueue),
-    Current(JobQueue),
-}
-
-impl Deref for ThreadJobQueue<'_> {
-    type Target = JobQueue;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Worker(queue) => queue,
-            Self::Current(queue) => queue,
-        }
-    }
-}
-
-impl DerefMut for ThreadJobQueue<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Worker(queue) => queue,
-            Self::Current(queue) => queue,
-        }
-    }
-}
-
 /// A `Scope`d object that you can run fork-join workloads on.
 ///
 /// # Examples
 ///
 /// ```
 /// # use chili::ThreadPool;
-/// let mut tp = ThreadPool::new();
-/// let mut s = tp.scope();
 ///
 /// let mut vals = [0; 2];
 /// let (left, right) = vals.split_at_mut(1);
-///
+/// {
+/// let mut tp = ThreadPool::new();
+/// let mut s = tp.scope();
 /// s.join(|_| left[0] = 1, |_| right[0] = 1);
-///
+/// }
 /// assert_eq!(vals, [1; 2]);
 /// ```
-#[derive(Debug)]
+
 pub struct Scope<'s> {
     context: Arc<Context>,
-    job_queue: ThreadJobQueue<'s>,
+    job_queue: JobQueue<'s>,
     heartbeat: Arc<AtomicBool>,
     join_count: u8,
+    shared_jobs: Mutex<BTreeMap<usize, (u64, Box<dyn ExecuteJob<'s> + 's>)>>,
 }
 
 impl<'s> Scope<'s> {
@@ -263,20 +230,22 @@ impl<'s> Scope<'s> {
 
         Self {
             context: thread_pool.context.clone(),
-            job_queue: ThreadJobQueue::Current(JobQueue::default()),
+            job_queue: JobQueue::default(),
             heartbeat,
             join_count: 0,
+            shared_jobs: Default::default(),
         }
     }
 
-    fn new_from_worker(context: Arc<Context>, job_queue: &'s mut JobQueue) -> Self {
+    fn new_from_worker(context: Arc<Context>) -> Self {
         let heartbeat = context.lock.lock().unwrap().new_heartbeat();
 
         Self {
             context,
-            job_queue: ThreadJobQueue::Worker(job_queue),
+            job_queue: JobQueue::default(),
             heartbeat,
             join_count: 0,
+            shared_jobs: Default::default(),
         }
     }
 
@@ -284,38 +253,27 @@ impl<'s> Scope<'s> {
         Arc::as_ptr(&self.heartbeat) as usize
     }
 
-    fn wait_for_sent_job<T>(&mut self, job: &Job<T>) -> Option<thread::Result<T>> {
+    fn return_job(&mut self, job_id: usize) -> Option<Box<dyn ExecuteJob<'s> + 's>> {
+        let mut shared_jobs = self.shared_jobs.lock().unwrap();
+        if shared_jobs
+            .get(&self.heartbeat_id())
+            .map(|(_, shared_job)| job_id == shared_job.id())
+            .is_some()
         {
-            let mut lock = self.context.lock.lock().unwrap();
-            if lock
-                .shared_jobs
-                .get(&self.heartbeat_id())
-                .map(|(_, shared_job)| job.eq(shared_job))
-                .is_some()
-            {
-                if let Some((_, job)) = lock.shared_jobs.remove(&self.heartbeat_id()) {
-                    // SAFETY:
-                    // Since the `Future` has already been allocated when
-                    // popping from the queue, the `Job` needs manual dropping.
-                    unsafe {
-                        job.drop();
-                    }
-                }
-
-                return None;
+            if let Some((_, job)) = shared_jobs.remove(&self.heartbeat_id()) {
+                return Some(job);
             }
         }
 
+        None
+    }
+
+    fn wait_for_sent_job<T: Send>(&mut self, fut: &Future<T>) -> thread::Result<T> {
         // SAFETY:
         // For this `Job` to have crossed thread borders, it must have been
         // popped from the `JobQueue` and shared.
-        while !unsafe { job.poll() } {
-            let job = {
-                let mut lock = self.context.lock.lock().unwrap();
-                lock.pop_earliest_shared_job()
-            };
-
-            if let Some(job) = job {
+        while !fut.poll() {
+            if let Some(job) = self.pop_earliest_shared_job() {
                 // SAFETY:
                 // Any `Job` that was shared between threads is waited upon
                 // before the `JobStack` exits scope.
@@ -330,7 +288,7 @@ impl<'s> Scope<'s> {
         // SAFETY:
         // Any `Job` that was shared between threads is waited upon before the
         // `JobStack` exits scope.
-        unsafe { job.wait() }
+        fut.wait()
     }
 
     #[cold]
@@ -338,7 +296,8 @@ impl<'s> Scope<'s> {
         let mut lock = self.context.lock.lock().unwrap();
 
         let time = lock.time;
-        if let Entry::Vacant(e) = lock.shared_jobs.entry(self.heartbeat_id()) {
+        let mut shared_jobs = self.shared_jobs.lock().unwrap();
+        if let Entry::Vacant(e) = shared_jobs.entry(self.heartbeat_id()) {
             if let Some(job) = self.job_queue.pop_front() {
                 e.insert((time, job));
 
@@ -352,8 +311,8 @@ impl<'s> Scope<'s> {
 
     fn join_seq<A, B, RA, RB>(&mut self, a: A, b: B) -> (RA, RB)
     where
-        A: FnOnce(&mut Scope<'_>) -> RA + Send,
-        B: FnOnce(&mut Scope<'_>) -> RB + Send,
+        A: FnOnce(&mut Self) -> RA + Send,
+        B: FnOnce(&mut Self) -> RB + Send,
         RA: Send,
         RB: Send,
     {
@@ -365,12 +324,12 @@ impl<'s> Scope<'s> {
 
     fn join_heartbeat<A, B, RA, RB>(&mut self, a: A, b: B) -> (RA, RB)
     where
-        A: FnOnce(&mut Scope<'_>) -> RA + Send,
-        B: FnOnce(&mut Scope<'_>) -> RB + Send,
-        RA: Send,
-        RB: Send,
+        A: FnOnce(&mut Self) -> RA + Send + 's,
+        B: FnOnce(&mut Self) -> RB + Send + 's,
+        RA: Send + 's,
+        RB: Send + 's,
     {
-        let a = move |scope: &mut Scope<'_>| {
+        let a = move |scope: &mut Self| {
             if scope.heartbeat.load(Ordering::Relaxed) {
                 scope.heartbeat();
             }
@@ -380,33 +339,27 @@ impl<'s> Scope<'s> {
 
         let stack = JobStack::new(a);
         let job = Job::new(&stack);
+        let fut = job.prepare();
+        let job_id = job.id();
 
-        // SAFETY:
-        // `job` is alive until the end of this scope.
-        unsafe {
-            self.job_queue.push_back(&job);
-        }
+        self.job_queue.push_back(Box::new(job));
 
         let rb = b(self);
 
-        if job.is_waiting() {
-            self.job_queue.pop_back();
-
+        if self.job_queue.pop_back().is_some() {
             // SAFETY:
             // Since the `job` was popped from the back of the queue, it cannot
             // take the closure out of the `JobStack` anymore.
             // `JobStack::take_once` is thus called only once.
             (unsafe { (stack.take_once())(self) }, rb)
         } else {
-            let ra = match self.wait_for_sent_job(&job) {
-                Some(Ok(val)) => val,
-                Some(Err(e)) => panic::resume_unwind(e),
-                // SAFETY:
-                // Since the `job` didn't have the chance to be actually
-                // sent across threads, it cannot take the closure out of the
-                // `JobStack` anymore. `JobStack::take_once` is thus called
-                // only once.
-                None => unsafe { (stack.take_once())(self) },
+            if let Some(_job) = self.return_job(job_id) {
+                return (unsafe { (stack.take_once())(self) }, rb);
+            }
+
+            let ra = match self.wait_for_sent_job(&fut) {
+                Ok(val) => val,
+                Err(e) => panic::resume_unwind(e),
             };
 
             (ra, rb)
@@ -422,20 +375,22 @@ impl<'s> Scope<'s> {
     /// # Examples
     ///
     /// ```
-    /// # use chili::Scope;
+    /// # use chili::{Scope, ThreadPool};
     /// let mut vals = [0; 2];
-    /// let (left, right) = vals.split_at_mut(1);
+    /// let (mut left, mut right) = vals.split_at_mut(1);
     ///
-    /// Scope::global().join(|_| left[0] = 1, |_| right[0] = 1);
-    ///
+    /// {
+    ///    let (left_r, right_r) = (&mut left, &mut right);
+    ///    ThreadPool::new().scope().join(|_| left_r[0] = 1, |_| right_r[0] = 1);
+    /// }
     /// assert_eq!(vals, [1; 2]);
     /// ```
     pub fn join<A, B, RA, RB>(&mut self, a: A, b: B) -> (RA, RB)
     where
-        A: FnOnce(&mut Scope<'_>) -> RA + Send,
-        B: FnOnce(&mut Scope<'_>) -> RB + Send,
-        RA: Send,
-        RB: Send,
+        A: FnOnce(&mut Self) -> RA + Send + 's,
+        B: FnOnce(&mut Self) -> RB + Send + 's,
+        RA: Send + 's,
+        RB: Send + 's,
     {
         self.join_with_heartbeat_every::<64, _, _, _, _>(a, b)
     }
@@ -449,13 +404,16 @@ impl<'s> Scope<'s> {
     /// # Examples
     ///
     /// ```
-    /// # use chili::Scope;
+    /// # use chili::{Scope, ThreadPool};
     ///
     /// let mut vals = [0; 2];
-    /// let (left, right) = vals.split_at_mut(1);
+    /// let (mut left, mut right) = vals.split_at_mut(1);
+    /// let (left_r, right_r) = (&mut left, &mut right);
     ///
     /// // Skip checking 7/8 calls to join_with_heartbeat_every.
-    /// Scope::global().join_with_heartbeat_every::<8, _, _, _, _>(|_| left[0] = 1, |_| right[0] = 1);
+    /// {
+    /// ThreadPool::new().scope().join_with_heartbeat_every::<8, _, _, _, _>(|_| left_r[0] = 1, |_| right_r[0] = 1);
+    /// }
     ///
     /// assert_eq!(vals, [1; 2]);
     /// ```
@@ -465,10 +423,10 @@ impl<'s> Scope<'s> {
         b: B,
     ) -> (RA, RB)
     where
-        A: FnOnce(&mut Scope<'_>) -> RA + Send,
-        B: FnOnce(&mut Scope<'_>) -> RB + Send,
-        RA: Send,
-        RB: Send,
+        A: FnOnce(&mut Self) -> RA + Send + 's,
+        B: FnOnce(&mut Self) -> RB + Send + 's,
+        RA: Send + 's,
+        RB: Send + 's,
     {
         self.join_count = self.join_count.wrapping_add(1) % TIMES;
 
@@ -477,6 +435,18 @@ impl<'s> Scope<'s> {
         } else {
             self.join_seq(a, b)
         }
+    }
+
+    /// TODO
+    ///
+    ///
+    /// # Examples
+    pub fn pop_earliest_shared_job(&mut self) -> Option<Box<dyn ExecuteJob<'s> + 's>> {
+        self.shared_jobs
+            .lock()
+            .unwrap()
+            .pop_first()
+            .map(|(_, (_, shared_job))| shared_job)
     }
 }
 
@@ -596,13 +566,13 @@ impl ThreadPool {
     ///
     /// ```
     /// # use chili::ThreadPool;
-    /// let mut s = ThreadPool::global().scope();
     ///
     /// let mut vals = [0; 2];
     /// let (left, right) = vals.split_at_mut(1);
-    ///
+    /// {
+    /// let mut s = ThreadPool::global().scope();
     /// s.join(|_| left[0] = 1, |_| right[0] = 1);
-    ///
+    /// }
     /// assert_eq!(vals, [1; 2]);
     /// ```
     pub fn global() -> &'static ThreadPool {
@@ -612,17 +582,19 @@ impl ThreadPool {
     /// Returns a `Scope`d object that you can run fork-join workloads on.
     ///
     /// # Examples
-    ///
     /// ```
     /// # use chili::ThreadPool;
-    /// let mut tp = ThreadPool::new();
-    /// let mut s = tp.scope();
-    ///
     /// let mut vals = [0; 2];
-    /// let (left, right) = vals.split_at_mut(1);
-    ///
-    /// s.join(|_| left[0] = 1, |_| right[0] = 1);
-    ///
+    /// let (mut left, mut right) = vals.split_at_mut(1);
+    /// let (left_r, right_r) = (&mut left, &mut right);
+    /// {
+    /// let tp = ThreadPool::new();
+    /// let mut s = tp.scope();
+    /// s.join(|_| left_r[0] = 1, |_| right_r[0] = 1);
+    /// drop(s);
+    /// drop(tp);
+    /// }
+
     /// assert_eq!(vals, [1; 2]);
     /// ```
     pub fn scope(&self) -> Scope<'_> {
@@ -680,11 +652,14 @@ mod tests {
     #[test]
     fn join_basic() {
         let threat_pool = ThreadPool::new();
-        let mut scope = threat_pool.scope();
 
         let mut a = 0;
         let mut b = 0;
-        scope.join(|_| a += 1, |_| b += 1);
+
+        {
+            let mut scope = threat_pool.scope();
+            scope.join(|_| a += 1, |_| b += 1);
+        }
 
         assert_eq!(a, 1);
         assert_eq!(b, 1);
@@ -694,7 +669,7 @@ mod tests {
     fn join_long() {
         let threat_pool = ThreadPool::new();
 
-        fn increment(s: &mut Scope, slice: &mut [u32]) {
+        fn increment<'s>(s: &mut Scope<'s>, slice: &'s mut [u32]) {
             match slice.len() {
                 0 => (),
                 1 => slice[0] += 1,
@@ -717,7 +692,7 @@ mod tests {
     fn join_very_long() {
         let threat_pool = ThreadPool::new();
 
-        fn increment(s: &mut Scope, slice: &mut [u32]) {
+        fn increment<'s>(s: &mut Scope<'s>, slice: &'s mut [u32]) {
             match slice.len() {
                 0 => (),
                 1 => slice[0] += 1,
@@ -745,7 +720,7 @@ mod tests {
             ..Default::default()
         });
 
-        fn increment(s: &mut Scope, slice: &mut [u32]) {
+        fn increment<'s>(s: &mut Scope<'s>, slice: &'s mut [u32]) {
             match slice.len() {
                 0 => (),
                 1 => slice[0] += 1,
@@ -785,9 +760,14 @@ mod tests {
             }
         }
 
-        fn increment(s: &mut Scope, slice: &mut [u32], id: ThreadId) -> bool {
-            let mut threads_crossed = AtomicBool::new(false);
+        let threads_crossed = AtomicBool::new(false);
 
+        fn increment<'s>(
+            s: &mut Scope<'s>,
+            slice: &'s mut [u32],
+            id: ThreadId,
+            threads_crossed: &'s AtomicBool,
+        ) -> bool {
             match slice.len() {
                 0 => (),
                 1 => slice[0] += 1,
@@ -795,7 +775,7 @@ mod tests {
                     let (head, tail) = slice.split_at_mut(1);
 
                     s.join_with_heartbeat_every::<1, _, _, _, _>(
-                        |_| {
+                        move |_| {
                             thread::sleep(Duration::from_micros(100));
 
                             if thread::current().id() != id {
@@ -805,18 +785,22 @@ mod tests {
 
                             head[0] += 1;
                         },
-                        |s| increment(s, tail, id),
+                        move |s| increment(s, tail, id, threads_crossed),
                     );
                 }
             }
 
-            *threads_crossed.get_mut()
+            threads_crossed.load(Ordering::Relaxed)
         }
 
         let mut vals = [0; 10];
 
-        let threads_crossed =
-            increment(&mut threat_pool.scope(), &mut vals, thread::current().id());
+        let threads_crossed = increment(
+            &mut threat_pool.scope(),
+            &mut vals,
+            thread::current().id(),
+            &threads_crossed,
+        );
 
         // Since there was no panic up to this point, this means that the
         // thread boundary has not been crossed.
